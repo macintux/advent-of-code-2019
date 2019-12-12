@@ -1,44 +1,41 @@
 -module(intcode).
 -compile(export_all).
 
--define(DEBUG(X, Y), ok).
-%% -define(DEBUG(X, Y), io:format(X, Y)).
-
-params(Params, Memory) ->
-    lists:map(fun(P) -> param(P, Memory) end,
-              Params).
-
-param({immediate, Param}, _Memory) ->
-    Param;
-param({position, Param}, Memory) ->
-    array:get(Param, Memory).
+-include("intcode.hrl").
 
 %% Each operator is a 3-tuple: operation name, arity, and function to
 %% be invoked with the required number of parameters.
 %%
-%% Any operator functions that require the last parameter to be
-%% positional (so the result can be stored there) should validate that
-%% `position` is the mode tag.
+%% The full state is supplied as an argument, including any pending
+%% inputs and queued outputs, so the two arguments to the operator
+%% function are a list of parameters and the state.
 %%
-%% User inputs are now supplied via a second argument to the operator
-%% function, so the arguments are: a list of parameters, a 2-tuple with
-%% inputs and outputs, and the array representing current memory.
+%% The result is a list of 2-tuples:
+%%    * An atom indicating what changed:
+%%      * `memory`        - memory changed
+%%      * `ip`            - non-linear change to the instruction pointer
+%%      * `base`          - relative base changed
+%%      * `input`         - change in the input FIFO queue
+%%      * `output`        - change in the output FIFO queue
+%%      * `block`         - need more input
+%%      * `none`          - no changes (e.g., jump that didn't)
+%%      * `terminate`     - end of execution
+%%    * The changed value (`undefined` if no change to state)
 %%
-%% The outcome is a 3-tuple: `memory`, `new_ip`, or `end_of_execution`
-%% indicating the outcome, the IO data, and the new memory.
+%% Each operator function should treat the state and its components as
+%% opaque, although they are expected to pattern match the parameters.
 %%
-%% If a new instruction pointer is generated (`new_ip`) the last
-%% element of the 3-tuple will itself be a tuple with the new
-%% instruction pointer and the new memory
+%% They may only invoke functions defined in `ic_ops`.
 operators() ->
     #{
       %% 1: add
       1 => {
             "add",
             3,
-            fun([MR1, MR2, {position, M3}], IO, Memory) ->
-                    [M1, M2] = params([MR1, MR2], Memory),
-                    {memory, IO, array:set(M3, M1+M2, Memory)}
+            fun([I1, I2, O], State) ->
+                    [{V1, _}, {V2, _}] = ic_ops:params_as_value([I1, I2], State),
+                    {OAddr, Block} = ic_ops:param_as_address(O, State),
+                    [{memory, ic_ops:update_memory(OAddr, V1+V2, Block)}]
             end
            },
 
@@ -47,43 +44,51 @@ operators() ->
       2 => {
             "mult",
             3,
-            fun([MR1, MR2, {position, M3}], IO, Memory) ->
-                    [M1, M2] = params([MR1, MR2], Memory),
-                    {memory, IO, array:set(M3, M1*M2, Memory)}
-            end},
+            fun([I1, I2, O], State) ->
+                    [{V1, _}, {V2, _}] = ic_ops:params_as_value([I1, I2], State),
+                    {OAddr, Block} = ic_ops:param_as_address(O, State),
+                    [{memory, ic_ops:update_memory(OAddr, V1*V2, Block)}]
+            end
+           },
 
       3 => {
             "input",
             1,
-            fun([{position, M1}], {[], Out}, Memory) ->
-                    {ok, [Input]} = io:fread("Op3 input? ", "~d"),
-                    {memory, {[], Out}, array:set(M1, Input, Memory)};
-               ([{position, M1}], {[Input|T], Out}, Memory) ->
-                    ?DEBUG("Used ~p as Op3 input~n", [Input]),
-                    {memory, {T, Out}, array:set(M1, Input, Memory)}
+            fun([O], State) ->
+                    case ic_ops:state_input(State) of
+                        [] ->
+                            [{block, undefined}];
+                        [Next|T] ->
+                            ?DEBUG("Used ~p as Op3 input~n", [Next]),
+                            {OAddr, Block} = ic_ops:param_as_address(O, State),
+                            [{memory, ic_ops:update_memory(OAddr, Next, Block)},
+                             {input, T}]
+                    end
             end
            },
 
       4 => {
             "output",
             1,
-            fun([MR1], {In, Out}, Memory) ->
-                    M1 = param(MR1, Memory),
+            fun([MR1], State) ->
+                    [{M1, _}] = ic_ops:params_as_value([MR1], State),
                     ?DEBUG("Op4 output: ~B~n", [M1]),
-                    {memory, {In, [M1|Out]}, Memory}
+                    Output = ic_ops:state_output(State),
+                    [{output, Output ++ [M1]}]
             end
            },
 
       5 => {
             "jump-if-true",
             2,
-            fun([MR1, MR2], IO, Memory) ->
-                    [M1, M2] = params([MR1, MR2], Memory),
+            fun([MR1, MR2], State) ->
+                    [{M1, _}, {M2, _}] =
+                        ic_ops:params_as_value([MR1, MR2], State),
                     case M1 /= 0 of
                         true ->
-                            {new_ip, IO, {M2, Memory}};
+                            [{ip, M2}];
                         false ->
-                            {memory, IO, Memory}
+                            [{none, undefined}]
                     end
             end
            },
@@ -91,13 +96,14 @@ operators() ->
       6 => {
             "jump-if-false",
             2,
-            fun([MR1, MR2], IO, Memory) ->
-                    [M1, M2] = params([MR1, MR2], Memory),
+            fun([MR1, MR2], State) ->
+                    [{M1, _}, {M2, _}] =
+                        ic_ops:params_as_value([MR1, MR2], State),
                     case M1 == 0 of
                         true ->
-                            {new_ip, IO, {M2, Memory}};
+                            [{ip, M2}];
                         false ->
-                            {memory, IO, Memory}
+                            [{none, undefined}]
                     end
             end
            },
@@ -105,13 +111,15 @@ operators() ->
       7 => {
             "less-than",
             3,
-            fun([MR1, MR2, {position, M3}], IO, Memory) ->
-                    [M1, M2] = params([MR1, MR2], Memory),
+            fun([MR1, MR2, O], State) ->
+                    [{M1, _}, {M2, _}] =
+                        ic_ops:params_as_value([MR1, MR2], State),
+                    {OAddr, Mem} = ic_ops:param_as_address(O, State),
                     case M1 < M2 of
                         true ->
-                            {memory, IO, array:set(M3, 1, Memory)};
+                            [{memory, ic_ops:update_memory(OAddr, 1, Mem)}];
                         false ->
-                            {memory, IO, array:set(M3, 0, Memory)}
+                            [{memory, ic_ops:update_memory(OAddr, 0, Mem)}]
                     end
             end
            },
@@ -119,22 +127,32 @@ operators() ->
       8 => {
             "equals",
             3,
-            fun([MR1, MR2, {position, M3}], IO, Memory) ->
-                    [M1, M2] = params([MR1, MR2], Memory),
+            fun([MR1, MR2, O], State) ->
+                    [{M1, _}, {M2, _}] =
+                        ic_ops:params_as_value([MR1, MR2], State),
+                    {OAddr, Mem} = ic_ops:param_as_address(O, State),
                     case M1 == M2 of
                         true ->
-                            {memory, IO, array:set(M3, 1, Memory)};
+                            [{memory, ic_ops:update_memory(OAddr, 1, Mem)}];
                         false ->
-                            {memory, IO, array:set(M3, 0, Memory)}
+                            [{memory, ic_ops:update_memory(OAddr, 0, Mem)}]
                     end
             end
            },
 
-
+      9 => {
+            "base",
+            1,
+            fun([MR1], State) ->
+                    [{M1, _}] = ic_ops:params_as_value([MR1], State),
+                    OldBase = ic_ops:state_base(State),
+                    [{base, OldBase+M1}]
+            end
+           },
       99 => {
              "terminate",
              0,
-             fun([], IO, Memory) -> {end_of_execution, IO, Memory} end
+             fun([], _State) -> [{terminate, undefined}] end
             }
      }.
 
@@ -147,7 +165,8 @@ decipher_operator(Data) ->
     ParameterModes = intsplit(Data div 100, []),
     {Op,
      lists:reverse(lists:map(fun(0) -> position;
-                                (1) -> immediate
+                                (1) -> immediate;
+                                (2) -> relative
                              end, ParameterModes))}.
 
 intsplit(Val, Accum) when Val =< 0 ->
@@ -156,14 +175,28 @@ intsplit(Val, Accum) ->
     intsplit(Val div 10, [Val rem 10|Accum]).
 
 
-execute(IP, Memory, IO, Operators) ->
+%% First argument: instruction pointer
+%%
+%% Second argument: `continue` or `step` atom, indicating whether this
+%% is being executed one instruction at a time or whether it should
+%% continue until termination or blocked on input
+%%
+%% Return value: {Status, NextIP, State} where Status is one of these atoms:
+%%    * `terminated`
+%%    * `blocked`
+%%    * `step`  - only possible in step mode
+execute(IP, DoNext,
+        #state{memory=Memory,
+               operators=Operators}=State) ->
     {Op, Modes} = decipher_operator(array:get(IP, Memory)),
+    ?DEBUG("Operator ~p~n", [Op]),
     #{Op := {Label, ParamCount, OpFun}} = Operators,
     Parameters = map_by_mode(retrieve(IP+1, ParamCount, Memory), Modes, []),
     ?DEBUG("Executing ~s~n", [Label]),
-    check_execution(IP+ParamCount+1,
-                    OpFun(Parameters, IO, Memory),
-                    Operators).
+    check_execution(DoNext, IP+ParamCount+1,
+                    OpFun(Parameters, State),
+                    State).
+
 
 map_by_mode([], _Modes, Acc) ->
     lists:reverse(Acc);
@@ -172,20 +205,61 @@ map_by_mode([H|T], [], Acc) ->
 map_by_mode([H|T], [M|Rest], Acc) ->
     map_by_mode(T, Rest, [{M, H}|Acc]).
 
-check_execution(_NextIP, {end_of_execution, IO, NewMem}, _Ops) ->
-    {IO, NewMem};
-check_execution(_NextIP, {new_ip, IO, {RealNextIP, NewMem}}, Ops) ->
-    execute(RealNextIP, NewMem, IO, Ops);
-check_execution(NextIP, {memory, IO, NewMem}, Ops) ->
-    execute(NextIP, NewMem, IO, Ops).
+%% Make sure that if `terminate` or `blocked` is one of the outcomes
+%% of our operation, that's the last change in the list.
+change_comp({terminate, undefined}, _) ->
+    false;
+change_comp({block, undefined}, _) ->
+    false;
+change_comp(_, _) ->
+    true.
 
+check_execution(DoNext, NextIP, Changes, State) ->
+    {Status, NewNextIP, NewState} =
+        apply_changes(NextIP,
+                      lists:sort(fun change_comp/2, Changes),
+                      State, step),
+    pause_or_continue(DoNext, Status, NewNextIP, NewState).
 
-run(Memory) ->
-    run(Memory, []).
+pause_or_continue(continue, step, IP, State) ->
+    execute(IP, continue, State);
+pause_or_continue(_Mode, Status, IP, State) ->
+    {Status, IP, State}.
 
-run(Memory, Inputs) ->
-    {{_Inputs, Outputs}, _NewMem} = execute(0, Memory, {Inputs, []}, operators()),
-    Outputs.
+%% lists:foldl would be a viable alternative to recursion here but
+%% recursion seems a bit friendlier. Make sure any halting result is
+%% sorted to be the last outcome.
+apply_changes(IP, [], State, Next) ->
+    {Next, IP, State};
+apply_changes(IP, [{terminate, undefined}], State, _Next) ->
+    {terminated, IP, State};
+apply_changes(IP, [{block, undefined}], State, _Next) ->
+    {blocked, IP, State};
+apply_changes(IP, [{none, undefined}|T], State, Next) ->
+    apply_changes(IP, T, State, Next);
+apply_changes(_IP, [{ip, New}|T], State, Next) ->
+    apply_changes(New, T, State, Next);
+apply_changes(IP, [{memory, Value}|T], State, Next) ->
+    apply_changes(IP, T, State#state{memory=Value}, Next);
+apply_changes(IP, [{base, Value}|T], State, Next) ->
+    apply_changes(IP, T, State#state{base=Value}, Next);
+apply_changes(IP, [{input, Value}|T], State, Next) ->
+    apply_changes(IP, T, State#state{input=Value}, Next);
+apply_changes(IP, [{output, Value}|T], State, Next) ->
+    apply_changes(IP, T, State#state{output=Value}, Next).
+
+run(State) ->
+    run([], State).
+
+run(Inputs, State) ->
+    execute(0, continue, State#state{input=Inputs}).
+
+load_list(Ints) ->
+    #state{memory=array:from_list(Ints, 0),
+           operators=operators(),
+           base=0,
+           input=[],
+           output=[]}.
 
 load(Filename) ->
-    array:from_list(myio:all_integers(Filename)).
+    load_list(myio:all_integers(Filename)).
