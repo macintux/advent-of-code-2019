@@ -8,9 +8,3 @@
                 input,
                 output
                }).
-
-%% All arrays (`contents`) will hold 1024 values.
--record(mem, {
-              start,
-              contents
-             }).

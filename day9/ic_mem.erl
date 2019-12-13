@@ -7,6 +7,12 @@
 -define(BLOCK_SIZE, 1024).
 
 
+%% All arrays (`contents`) will hold 1024 values.
+-record(mem, {
+              start,
+              contents
+             }).
+
 %% I would like to create blocks of memory for the intcode computer
 %% but I'm going to go with a simpler array-based mechanism for
 %% now. Retaining this code for future use.
