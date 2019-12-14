@@ -57,7 +57,13 @@ operators() ->
             fun([O], State) ->
                     case ic_ops:state_input(State) of
                         [] ->
-                            [{block, undefined}];
+                            %% We're blocked and need to make sure we
+                            %% don't let the calling code advance our
+                            %% instruction pointer. When we get back
+                            %% to this code, we need to try the input
+                            %% operation again
+                            [{ip, ic_ops:state_ip(State)},
+                             {block, undefined}];
                         [Next|T] ->
                             ?DEBUG("Used ~p as Op3 input~n", [Next]),
                             {OAddr, Block} = ic_ops:param_as_address(O, State),
@@ -175,19 +181,18 @@ intsplit(Val, Accum) ->
     intsplit(Val div 10, [Val rem 10|Accum]).
 
 
-%% First argument: instruction pointer
-%%
-%% Second argument: `continue` or `step` atom, indicating whether this
+%% First argument: `continue` or `step` atom, indicating whether this
 %% is being executed one instruction at a time or whether it should
 %% continue until termination or blocked on input
 %%
-%% Return value: {Status, NextIP, State} where Status is one of these atoms:
+%% Return value: {Status, State} where Status is one of these atoms:
 %%    * `terminated`
 %%    * `blocked`
 %%    * `step`  - only possible in step mode
-execute(IP, DoNext,
-        #state{memory=Memory,
-               operators=Operators}=State) ->
+execute(DoNext,
+        #state{memory=Memory, ip=IP,
+               operators=Operators, input=Input}=State) ->
+    ?DEBUG("Current inputs: ~p~n", [Input]),
     {Op, Modes} = decipher_operator(array:get(IP, Memory)),
     ?DEBUG("Operator ~p~n", [Op]),
     #{Op := {Label, ParamCount, OpFun}} = Operators,
@@ -215,51 +220,57 @@ change_comp(_, _) ->
     true.
 
 check_execution(DoNext, NextIP, Changes, State) ->
-    {Status, NewNextIP, NewState} =
-        apply_changes(NextIP,
-                      lists:sort(fun change_comp/2, Changes),
-                      State, step),
-    pause_or_continue(DoNext, Status, NewNextIP, NewState).
+    {Status, NewState} =
+        apply_changes(lists:sort(fun change_comp/2, Changes),
+                      State#state{ip=NextIP}, step),
+    pause_or_continue(DoNext, Status, NewState).
 
-pause_or_continue(continue, step, IP, State) ->
-    execute(IP, continue, State);
-pause_or_continue(_Mode, Status, IP, State) ->
-    {Status, IP, State}.
+pause_or_continue(continue, step, State) ->
+    execute(continue, State);
+pause_or_continue(_Mode, Status, State) ->
+    {Status, State}.
 
 %% lists:foldl would be a viable alternative to recursion here but
 %% recursion seems a bit friendlier. Make sure any halting result is
 %% sorted to be the last outcome.
-apply_changes(IP, [], State, Next) ->
-    {Next, IP, State};
-apply_changes(IP, [{terminate, undefined}], State, _Next) ->
-    {terminated, IP, State};
-apply_changes(IP, [{block, undefined}], State, _Next) ->
-    {blocked, IP, State};
-apply_changes(IP, [{none, undefined}|T], State, Next) ->
-    apply_changes(IP, T, State, Next);
-apply_changes(_IP, [{ip, New}|T], State, Next) ->
-    apply_changes(New, T, State, Next);
-apply_changes(IP, [{memory, Value}|T], State, Next) ->
-    apply_changes(IP, T, State#state{memory=Value}, Next);
-apply_changes(IP, [{base, Value}|T], State, Next) ->
-    apply_changes(IP, T, State#state{base=Value}, Next);
-apply_changes(IP, [{input, Value}|T], State, Next) ->
-    apply_changes(IP, T, State#state{input=Value}, Next);
-apply_changes(IP, [{output, Value}|T], State, Next) ->
-    apply_changes(IP, T, State#state{output=Value}, Next).
+apply_changes([], State, Next) ->
+    {Next, State};
+apply_changes([{terminate, undefined}], State, _Next) ->
+    {terminated, State};
+apply_changes([{block, undefined}], State, _Next) ->
+    {blocked, State};
+apply_changes([{none, undefined}|T], State, Next) ->
+    apply_changes(T, State, Next);
+apply_changes([{ip, IP}|T], State, Next) ->
+    apply_changes(T, State#state{ip=IP}, Next);
+apply_changes([{memory, Value}|T], State, Next) ->
+    apply_changes(T, State#state{memory=Value}, Next);
+apply_changes([{base, Value}|T], State, Next) ->
+    apply_changes(T, State#state{base=Value}, Next);
+apply_changes([{input, Value}|T], State, Next) ->
+    apply_changes(T, State#state{input=Value}, Next);
+apply_changes([{output, Value}|T], State, Next) ->
+    apply_changes(T, State#state{output=Value}, Next).
 
 run(State) ->
     run([], State).
 
 run(Inputs, State) ->
-    execute(0, continue, State#state{input=Inputs}).
+    execute(continue, State#state{input=Inputs}).
 
 load_list(Ints) ->
     #state{memory=array:from_list(Ints, 0),
            operators=operators(),
            base=0,
            input=[],
-           output=[]}.
+           output=[],
+           ip=0}.
 
 load(Filename) ->
     load_list(myio:all_integers(Filename)).
+
+add_input(#state{input=Inputs}=State, I) ->
+    State#state{input=Inputs ++ [I]}.
+
+add_inputs(#state{input=Inputs}=State, I) ->
+    State#state{input=Inputs ++ I}.
