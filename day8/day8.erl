@@ -1,6 +1,62 @@
 -module(day8).
 -compile(export_all).
 
+
+%% Logic for part 2:
+%%   Read Width*Height blocks of integers from the file
+%%   Superimpose them per the rules for day 8
+%%   Split the blocks into rows (lines)
+%%   Print each line
+part2(Filename, Width, Height) ->
+    Fh = myio:open_file(Filename),
+    OuterFun = fun() ->
+                       consolidate(fun() ->
+                                           layers:read_block(Fh, Width*Height)
+                                   end)
+               end,
+    print_until_end(OuterFun(), OuterFun, Width).
+
+print_until_end(eof, _Fun, _Width) ->
+    done;
+print_until_end(ImageBlock, Fun, Width) ->
+    render(layers:block_to_rows(ImageBlock, Width, [])),
+    print_until_end(Fun(), Fun, Width).
+
+to_string(Ints) ->
+    lists:map(fun(1) -> 64; %% Ampersand
+                 (0) -> 32  %% Blank
+              end, Ints).
+
+
+render([]) ->
+    done;
+render([H|T]) ->
+    io:format("~s~n", [to_string(H)]),
+    render(T).
+
+
+consolidate(Fun) ->
+    consolidate(Fun(), Fun, []).
+
+consolidate(eof, _Fun, []) ->
+    eof;
+consolidate(eof, _Fun, Accum) ->
+    Accum;
+consolidate(Image, Fun, Accum) ->
+    consolidate(Fun(), Fun, apply_image_mask(Image, Accum, [])).
+
+apply_image_mask([], [], New) ->
+    lists:reverse(New);
+apply_image_mask(FirstLayer, [], []) ->
+    FirstLayer;
+apply_image_mask([_H1|T1], [H2|T2], Accum) when H2 /= 2 ->
+    apply_image_mask(T1, T2, [H2|Accum]);
+apply_image_mask([H|T1], [2|T2], Accum) ->
+    apply_image_mask(T1, T2, [H|Accum]).
+
+
+
+
 part1(Filename, Width, Height) ->
     {ok, Fh} = file:open(Filename, [read]),
     [_Zeroes, Ones, Twos] = pick_layer_fewest_zeroes(
