@@ -6,11 +6,6 @@
                 base,
                 operators,
                 input,
-                output
+                output,
+                ip
                }).
-
-%% All arrays (`contents`) will hold 1024 values.
--record(mem, {
-              start,
-              contents
-             }).
