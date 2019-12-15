@@ -20,6 +20,9 @@ state_output(#state{output=O}) ->
 state_operators(#state{operators=O}) ->
     O.
 
+state_ip(#state{ip=IP}) ->
+    IP.
+
 find_memory(Addr, Memory) ->
     {array:get(Addr, Memory), Memory}.
 
